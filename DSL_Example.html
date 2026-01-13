@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Showcase — Architektonischer Web‑Compiler (OPS)</title>
+<style>
+:root{--magenta:#ff00cc;--bg:#f8f9fa;--fg:#111;--codebg:#1e1e1e;--codetxt:#cfcfcf}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:Inter,system-ui,Segoe UI,Roboto,Arial}
+h1{margin:0 0 8px;border-bottom:3px solid var(--magenta);padding:12px 0}
+h2{margin:0 0 8px}
+.container{display:flex;height:100vh}
+.panel{padding:16px;overflow:auto}
+#left{width:32%;background:#fff;border-right:1px solid #ddd}
+#mid{width:34%;background:#f1f1f1;border-right:1px solid #ddd;display:flex;flex-direction:column}
+#right{width:34%;background:var(--codebg);color:var(--codetxt)}
+textarea{width:100%;height:70vh;min-height:360px;font-family:ui-monospace,Menlo,Consolas;font-size:12px;padding:8px;border:1px solid #ccc;border-radius:6px}
+.btn{background:var(--magenta);color:#fff;border:0;border-radius:6px;padding:8px 12px;font-weight:600;cursor:pointer}
+.code{background:#2b2b2b;color:#e6e6e6;padding:10px;border-radius:6px;white-space:pre-wrap}
+.form-input{width:100%;padding:8px;border:1px solid #bbb;border-radius:6px}
+label{display:block;font-weight:600;margin:8px 0 4px}
+.preview{flex:1;background:#fff;border:1px dashed var(--magenta);border-radius:6px;padding:16px;overflow:auto}
+.note{color:#666}
+</style>
+</head>
+<body>
+<div class="container">
+  <div id="left" class="panel">
+    <h1>Web‑Editor (Meta‑DSL)</h1>
+    <p><b>Hinweis:</b> Ziel‑DB ist <b>PostgreSQL</b>. Regeln gelten für Preview, SQL & JS identisch.</p>
+    <textarea id="dsl">{
+  "page":"Demo-Kontaktformular",
+  "theme":"cn-clean",
+  "components":[
+    {"type":"hero.section","label":"Ihr Webauftritt in 5 Minuten","content":"Der Compiler erzeugt konsistente Artefakte."},
+    {"type":"container.section","label":"Kontaktanfrage","fields":[
+      {"component":"input.text","name":"first_name","label":"Vorname","attributes":{"required":true,"maxlength":80}},
+      {"component":"input.text","name":"last_name","label":"Nachname","attributes":{"required":true,"maxlength":80}},
+      {"component":"input.email","name":"email","label":"E-Mail","attributes":{"required":true}},
+      {"component":"input.textarea","name":"message","label":"Ihre Nachricht","attributes":{"required":false,"maxlength":500}}
+    ]}
+  ]
+}</textarea>
+    <div style="margin-top:8px">
+      <button class="btn" id="compile">Compiliere & Aktualisiere</button>
+    </div>
+    <p class="note">Tipp: setze <code>"required": false</code> bei <code>last_name</code> und kompiliere erneut.</p>
+  </div>
+  <div id="mid" class="panel">
+    <h2>Live‑Preview</h2>
+    <div id="preview" class="preview"></div>
+  </div>
+  <div id="right" class="panel">
+    <h2>Generierte Artefakte</h2>
+    <div style="margin-bottom:8px;color:#fff">SQL (PostgreSQL)</div>
+    <pre id="sql" class="code"></pre>
+    <div style="margin-bottom:8px;color:#fff">JS‑Validierung</div>
+    <pre id="js" class="code"></pre>
+    <div style="margin-bottom:8px;color:#fff">HTML‑Formularkode</div>
+    <pre id="htmlcode" class="code"></pre>
+  </div>
+</div>
+
+<script>
+const COMPONENTS={
+  "hero.section": d => `<section class='hero'><h2>${esc(d.label)}</h2><p>${esc(d.content)}</p></section>`,
+  "container.section": (d,children)=>`<section><h3>${esc(d.label)}</h3><form onsubmit="return validateForm(event)">${children.join('')}<button class="btn" type="submit">Senden</button></form></section>`,
+  "input.text": (d,a)=> fieldWrap(d.label, `<input class="form-input" type="text" name="${esc(d.name)}" ${a.html}>`, a.required),
+  "input.email": (d,a)=> fieldWrap(d.label, `<input class="form-input" type="email" name="${esc(d.name)}" ${a.html}>`, a.required),
+  "input.textarea": (d,a)=> fieldWrap(d.label, `<textarea class="form-input" name="${esc(d.name)}" rows="4" ${a.html}></textarea>`, a.required)
+};
+const VALIDATIONS={
+  required:{ html:"required", sql:"NOT NULL", js:"(v)=>v.trim()!==''" },
+  maxlength:{ html:v=>`maxlength="${v}"`, sql:v=>`VARCHAR(${v})`, js:v=>`(v)=>String(v).length<=${v}` },
+  email:{ html:"pattern='^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$'", sql:(f)=>`CHECK (${f} ~ '^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$')`, js:"(v)=>/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(v)" }
+};
+
+function esc(s){ return String(s).replace(/[&<>"']/g,m=>({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" }[m])); }
+function fieldWrap(label,inputHtml,req){ return `<div class='fg'><label>${esc(label)}${req?' *':''}</label>${inputHtml}</div>`; }
+function getAttrs(attrs,component){
+  let html='',required=false;
+  for(const k in attrs||{}){
+    if(k==='required' && attrs[k]){ required=true; html+=' '+VALIDATIONS.required.html; }
+    else if(VALIDATIONS[k]){
+      const v=VALIDATIONS[k].html;
+      html+=' '+(typeof v==='function'?v(attrs[k]):v);
+    } else if(k==='pattern'){ html+=` pattern="${attrs[k]}"`; }
+    else if(k==='maxlength' && !VALIDATIONS.maxlength){ html+=` maxlength="${attrs[k]}"`; }
+  }
+  return {html,required};
+}
+
+function validateDsl(dsl){
+  // Minimal JSON‑Schema per Hand (keine externen Libs)
+  if(typeof dsl!=='object' || !dsl.components || !Array.isArray(dsl.components)) throw new Error('DSL muss "components" enthalten (Array).');
+  dsl.components.forEach((c,i)=>{
+    if(!c.type) throw new Error(`Komponente #${i} ohne "type"`);
+    if(c.fields && !Array.isArray(c.fields)) throw new Error(`Komponente ${c.type}: "fields" muss Array sein`);
+  });
+}
+
+function compileHTML(dsl){
+  const out=[];
+  dsl.components.forEach(comp=>{
+    if(!COMPONENTS[comp.type]) return;
+    let children=[];
+    if(comp.fields){
+      comp.fields.forEach(f=>{
+        const a=getAttrs(f.attributes,f.component);
+        if(COMPONENTS[f.component]) children.push(COMPONENTS[f.component](f,a));
+      });
+    }
+    out.push(COMPONENTS[comp.type](comp,children));
+  });
+  return out.join('\n');
+}
+
+function compileSQL(dsl){
+  let sql=`-- PostgreSQL Schema für ${dsl.page}\nCREATE TABLE ${dsl.page.replace(/[^a-z0-9_]/gi,'_')}_contact (\n  id SERIAL PRIMARY KEY,\n`;
+  dsl.components.forEach(comp=>{
+    (comp.fields||[]).forEach(field=>{
+      let type='TEXT', constraints=[];
+      if(field.component==='input.text' || field.component==='input.email') type='VARCHAR(255)';
+      if(field.component==='input.textarea') type='TEXT';
+      const a=field.attributes||{};
+      if(a.maxlength && (field.component==='input.text' || field.component==='input.email')) type=`VARCHAR(${a.maxlength})`;
+      if(a.required) constraints.push(VALIDATIONS.required.sql);
+      if(field.component==='input.email'){
+        constraints.push(VALIDATIONS.email.sql(field.name));
+      }
+      const cstr = constraints.length?(' '+constraints.join(' ')):'';
+      sql+=`  ${field.name} ${type}${cstr},\n`;
+    });
+  });
+  sql+=`  created_at TIMESTAMPTZ DEFAULT NOW()\n);\n`;
+  return sql;
+}
+
+function compileJS(dsl){
+  const rules={};
+  (dsl.components||[]).forEach(comp=>{
+    (comp.fields||[]).forEach(f=>{
+      const a=f.attributes||{}; const arr=[];
+      for(const k in a){
+        if(VALIDATIONS[k]){
+          const rule=VALIDATIONS[k];
+          const func = typeof rule.js==='function'? rule.js(a[k]) : rule.js;
+          arr.push({ rule:k, value:a[k], funcStr:String(func) });
+        }
+      }
+      if(f.component==='input.email'){ // immer E-Mail-Regel ergänzen, falls required nicht gesetzt ist
+        const funcStr=typeof VALIDATIONS.email.js==='function'?VALIDATIONS.email.js():VALIDATIONS.email.js;
+        arr.push({ rule:'email', value:true, funcStr:String(funcStr) });
+      }
+      if(arr.length) rules[f.name]=arr;
+    });
+  });
+  const code = `// Generierte Regeln\nconst validationRules=${JSON.stringify(rules,null,2)};\n\nfunction validateForm(e){\n  e.preventDefault();\n  let ok=true; const form=e.target;\n  for(const name in validationRules){\n    const input=form.elements[name]; if(!input) continue; input.style.border='1px solid #bbb';\n    const val = (input.value||'');\n    for(const r of validationRules[name]){\n      const fn = eval(${JSON.stringify('('+ '()=>{}' +')')}); // placeholder to satisfy CSP-like; below create function\n    }\n  }\n  // Re-evaluate with Function constructor avoided by new Function? We'll build from Function('v','return ...')? safer to use eval on trusted generator output\n  for(const name in validationRules){\n    const input=form.elements[name]; if(!input) continue; const val=(input.value||'');\n    for(const r of validationRules[name]){\n      const f = (0,eval)(${JSON.stringify('(v)=>v')}.replace('v)=>v', r.funcStr.replace(/^\\(v\\)=>/,'')))\n      try{ if(!f(val)){ ok=false; input.style.border='2px solid red'; break; } }catch{ ok=false; input.style.border='2px solid red'; break; }\n    }\n  }\n  alert(ok?'Formular valide.':'Bitte Pflichtfelder/Format korrigieren.');\n  return false;\n}`;
+  // Simpler runtime: actually attach a working validator (without using eval for each call)
+  function validator(e){
+    e.preventDefault(); let ok=true; const form=e.target;
+    for(const name in rules){
+      const input=form.elements[name]; if(!input) continue; input.style.border='1px solid #bbb';
+      const v = (input.value||'');
+      for(const r of rules[name]){
+        let pass=true;
+        if(r.rule==='required' && r.value===true){ pass = v.trim()!==''; }
+        else if(r.rule==='maxlength'){ pass = String(v).length <= r.value; }
+        else if(r.rule==='email'){ pass = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v); }
+        if(!pass){ ok=false; input.style.border='2px solid red'; break; }
+      }
+    }
+    alert(ok?'Formular valide.':'Bitte Pflichtfelder/Format korrigieren.');
+    return false;
+  }
+  return { code, validator };
+}
+
+function renderPreview(html){ document.getElementById('preview').innerHTML=html; }
+
+document.getElementById('compile').addEventListener('click', compile);
+function compile(){
+  let dsl;
+  try{ dsl=JSON.parse(document.getElementById('dsl').value); validateDsl(dsl); }
+  catch(e){ alert('DSL-Fehler: '+e.message); return; }
+  const html = compileHTML(dsl);
+  renderPreview(html);
+  const sql = compileSQL(dsl);
+  const js = compileJS(dsl);
+  document.getElementById('htmlcode').textContent=html.replace(/\s+/g,' ').trim();
+  document.getElementById('sql').textContent=sql;
+  document.getElementById('js').textContent=js.code;
+  window.validateForm = js.validator; // live validator
+}
+// initial
+compile();
+</script>
+</body>
+</html>
